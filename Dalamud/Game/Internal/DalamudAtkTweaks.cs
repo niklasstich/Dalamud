@@ -9,7 +9,6 @@ using Dalamud.Game.Agent;
 using Dalamud.Game.Agent.AgentArgTypes;
 using Dalamud.Game.Gui;
 using Dalamud.Game.Text;
-using Dalamud.Game.Text.SeStringHandling;
 using Dalamud.Hooking;
 using Dalamud.Interface.Internal;
 using Dalamud.Interface.Windowing;
@@ -20,8 +19,7 @@ using Dalamud.Utility;
 using FFXIVClientStructs.FFXIV.Client.UI;
 using FFXIVClientStructs.FFXIV.Client.UI.Agent;
 using FFXIVClientStructs.FFXIV.Component.GUI;
-
-using ValueType = FFXIVClientStructs.FFXIV.Component.GUI.ValueType;
+using FFXIVClientStructs.Interop;
 
 namespace Dalamud.Game.Internal;
 
@@ -150,12 +148,12 @@ internal sealed unsafe class DalamudAtkTweaks : IInternalDisposableService
         if (!receiveEventArgs.AtkValueEnumerable.Any())
             return;
 
-        if (!receiveEventArgs.AtkValueEnumerable.ElementAt(0).TryGet(out int? eventValue))
+        if (!receiveEventArgs.AtkValueEnumerable.ElementAt(0).TryGet(out int eventValue))
             return;
 
         // Prevent recursion from our own injected event
         if (receiveEventArgs.AtkValueEnumerable.Count() == 2 &&
-            receiveEventArgs.AtkValueEnumerable.ElementAt(1).TryGet(out int? eventValue2) && eventValue2 == recursionSentinel)
+            receiveEventArgs.AtkValueEnumerable.ElementAt(1).TryGet(out int eventValue2) && eventValue2 == recursionSentinel)
         {
             Log.Verbose("Prevent recursion (eventValue {EventValue})", eventValue);
             return;
@@ -186,7 +184,7 @@ internal sealed unsafe class DalamudAtkTweaks : IInternalDisposableService
 
             addonSelectYesno->YesButton->SetEnabledState(false);
             addonSelectYesno->NoButton->SetEnabledState(false);
-            addonSelectYesno->DisableUserClose = true;
+            addonSelectYesno->ShouldFireCallbackAndHideOrClose = true;
 
             var cts = new CancellationTokenSource();
             cts.CancelAfter(60000);
@@ -197,18 +195,20 @@ internal sealed unsafe class DalamudAtkTweaks : IInternalDisposableService
             {
                 Service<Framework>.Get().Run(() =>
                 {
-                    addonSelectYesno->DisableUserClose = false;
+                    addonSelectYesno->ShouldFireCallbackAndHideOrClose = false;
                     addonSelectYesno->YesButton->SetEnabledState(true);
                     addonSelectYesno->NoButton->SetEnabledState(true);
                     addonSelectYesno->Close(false);
 
                     var dummyRet = stackalloc AtkValue[1];
-                    dummyRet->Type = ValueType.Undefined;
+                    dummyRet->Type = AtkValueType.Undefined;
                     dummyRet->Int = recursionSentinel;
 
                     var okAtkValue = stackalloc AtkValue[2];
-                    okAtkValue[0].SetInt(0);
-                    okAtkValue[1].SetInt(recursionSentinel);
+                    okAtkValue[0].Type = AtkValueType.Int;
+                    okAtkValue[0].Int = 0;
+                    okAtkValue[1].Type = AtkValueType.Int;
+                    okAtkValue[1].Int = recursionSentinel;
 
                     AgentLobby.Instance()->ReceiveEvent(
                         dummyRet,
@@ -253,34 +253,40 @@ internal sealed unsafe class DalamudAtkTweaks : IInternalDisposableService
             return;
         }
 
-        // the max size (hardcoded) is 0x12/18, but the system menu currently uses 0xC/12
-        // this is a just in case that doesnt really matter
-        // see if we can add 2 entries
-        if (menuSize >= 0x12)
+        const int maxEntries = 20; // the hardcoded amount of maximum entries
+        const int startIndex = 5; // the offset at which entries start
+        const int offset = 2; // the amount of entries we want to inject
+
+        var newMenuSize = (int)menuSize + offset;
+        if (newMenuSize >= maxEntries)
         {
             this.hookAgentHudOpenSystemMenu.Original(thisPtr, atkValueArgs, menuSize);
             return;
         }
 
-        // atkValueArgs is actually an array of AtkValues used as args. all their UI code works like this.
-        // in this case, menu size is stored in atkValueArgs[4], and the next 17 slots are the MainCommand
-        // the 17 slots after that, if they exist, are the entry names, but they are otherwise pulled from MainCommand EXD
-        // reference the original function for more details :)
+        using var values = new RentedAtkValues(startIndex + (maxEntries * 2));
 
-        // step 1) move all the current menu items down so we can put Dalamud at the top like it deserves
-        for (var i = menuSize + 2; i > 1; i--)
+        // copy beginning of AtkValues
+        for (var i = 0; i < startIndex; i++)
+            values[i].Copy(&atkValueArgs[i]);
+
+        // copy entries, but shifted
+        for (var i = startIndex; i < startIndex + menuSize; i++)
         {
-            ref var curEntry = ref atkValueArgs[i + 5 - 2];
-            ref var nextEntry = ref atkValueArgs[i + 5];
-            nextEntry.SetInt(curEntry.Int);
+            values[i + offset].Copy(&atkValueArgs[i]);
+            values[i + offset + maxEntries].Copy(&atkValueArgs[i + maxEntries]);
         }
 
-        // step 2) set our new entries to dummy commands
+        // set new menu size
+        values[3].SetInt(newMenuSize);
+
+        // set our new entries to dummy commands
         const int color = 539;
         using var rssb = new RentedSeStringBuilder();
+        var entryIndex = startIndex;
 
-        atkValueArgs[5].SetInt(69420);
-        atkValueArgs[5 + 18].SetManagedString(rssb.Builder
+        values[entryIndex].SetInt(69420);
+        values[entryIndex + maxEntries].SetManagedString(rssb.Builder
             .PushColorType(color)
             .Append($"{SeIconChar.BoxedLetterD.ToIconString()} ")
             .PopColorType()
@@ -288,19 +294,17 @@ internal sealed unsafe class DalamudAtkTweaks : IInternalDisposableService
             .GetViewAsSpan());
 
         rssb.Builder.Clear();
+        entryIndex++;
 
-        atkValueArgs[6].SetInt(69421);
-        atkValueArgs[6 + 18].SetManagedString(rssb.Builder
+        values[entryIndex].SetInt(69421);
+        values[entryIndex + maxEntries].SetManagedString(rssb.Builder
             .PushColorType(color)
             .Append($"{SeIconChar.BoxedLetterD.ToIconString()} ")
             .PopColorType()
             .Append(this.LocDalamudSettings)
             .GetViewAsSpan());
 
-        // open menu with new size
-        atkValueArgs[4].SetUInt(menuSize + 2);
-
-        this.hookAgentHudOpenSystemMenu.Original(thisPtr, atkValueArgs, menuSize + 2);
+        this.hookAgentHudOpenSystemMenu.Original(thisPtr, values, (uint)newMenuSize);
     }
 
     private void UiModuleExecuteMainCommandDetour(UIModule* thisPtr, uint commandId)
